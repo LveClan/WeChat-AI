@@ -1,0 +1,100 @@
+name: Deploy WeChat-AI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-wechat-ai
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Test, build, and deploy image
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+      SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+      SERVER_KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+
+    steps:
+      - name: Check deploy secrets
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test "$SERVER_USER" = deploy
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_SSH_KEY"
+          test -n "$SERVER_KNOWN_HOSTS"
+
+      - uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.15.0 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Check TypeScript
+        run: pnpm typecheck
+
+      - name: Build Docker image
+        run: docker build --tag "wechat-ai:${GITHUB_SHA}" .
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SERVER_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+      - name: Verify deploy account
+        run: |
+          set -euo pipefail
+          ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
+            'test "$(id -un)" = deploy && test -x /usr/local/sbin/deploy-wechat-ai'
+
+      - name: Upload image archive
+        run: |
+          set -euo pipefail
+          docker save "wechat-ai:${GITHUB_SHA}" | gzip -1 | \
+            ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
+              "umask 077; mkdir -p /home/deploy/wechat-ai-images; cat > /home/deploy/wechat-ai-images/${GITHUB_SHA}.tar.gz"
+
+      - name: Activate deployment
+        run: |
+          set -euo pipefail
+          ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
+            "sudo -n /usr/local/sbin/deploy-wechat-ai ${GITHUB_SHA}"
+
+      - name: Smoke test WeChat-AI
+        run: |
+          set -euo pipefail
+          ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/deploy_key -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" \
+            'curl -fsS http://127.0.0.1:8787/health'
